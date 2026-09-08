@@ -115,9 +115,25 @@ def identify_labeled_events(
     return labeled[["msno", "cutoff_date", "membership_expire_date", "is_churn"]].reset_index(drop=True)
 
 
-def build_member_features(tx: pd.DataFrame, labeled: pd.DataFrame, members: pd.DataFrame) -> pd.DataFrame:
+def build_member_features(
+    tx: pd.DataFrame, labeled: pd.DataFrame, members: pd.DataFrame, reference_date: str | pd.Timestamp
+) -> pd.DataFrame:
     """Build member-level features from each member's transaction history strictly
-    before their own labeled cutoff_date — never on or after it."""
+    before their own labeled cutoff_date — never on or after it.
+
+    reference_date is the external "as of" date the whole snapshot is being
+    evaluated at (train_cutoff, validation_cutoff, or "today" for live scoring)
+    — NOT each member's own cutoff_date. It's used to compute days_since_cutoff:
+    how long ago a member's labeled transaction was, relative to the moment
+    they're actually being scored. This is a real, non-leaky feature (fully known
+    at scoring time) and turns out to be an important one: within any snapshot,
+    members whose labeled transaction is old relative to the reference date are
+    disproportionately already-lapsed, while members whose labeled transaction is
+    recent are disproportionately still active. Omitting it forces a model to
+    reconstruct that signal indirectly from other features, which memorizes the
+    specific snapshot it was tuned on rather than learning something that
+    transfers — the exact mechanism behind a real regression caught during
+    Phase 5 tuning (near-perfect in-snapshot PR-AUC that collapsed out-of-time)."""
     merged = tx.merge(labeled[["msno", "cutoff_date"]], on="msno", how="inner")
     prior = merged[merged["transaction_date"] < merged["cutoff_date"]].copy()
     prior = prior.sort_values(["msno", "transaction_date"])
@@ -190,11 +206,12 @@ def build_member_features(tx: pd.DataFrame, labeled: pd.DataFrame, members: pd.D
         features["n_transactions_second_half"] - features["n_transactions_first_half"]
     )
     features["amount_paid_trend"] = features["avg_amount_second_half"] - features["avg_amount_first_half"]
+    features["days_since_cutoff"] = (pd.Timestamp(reference_date) - features["cutoff_date"]).dt.days
 
     feature_columns = [
         "msno", "cutoff_date", "is_churn",
         "n_prior_transactions", "n_active_days", "longest_gap_days",
-        "days_since_last_transaction", "days_since_first_payment",
+        "days_since_last_transaction", "days_since_first_payment", "days_since_cutoff",
         "total_amount_paid_prior", "avg_amount_paid_prior", "most_recent_plan_price",
         "n_prior_cancels", "has_prior_cancel", "days_since_last_cancel", "auto_renew_rate",
         "tenure_days", "registered_via",
@@ -204,19 +221,22 @@ def build_member_features(tx: pd.DataFrame, labeled: pd.DataFrame, members: pd.D
     return features[feature_columns].reset_index(drop=True)
 
 
-def build_feature_matrix(tx: pd.DataFrame, members: pd.DataFrame) -> pd.DataFrame:
+def build_feature_matrix(
+    tx: pd.DataFrame, members: pd.DataFrame, reference_date: str | pd.Timestamp
+) -> pd.DataFrame:
     """End-to-end, single snapshot: clean, label, and build features using each
     member's own last eligible transaction. One row per eligible member.
 
-    This is the right tool for LIVE SCORING (evaluate current members "as of
-    today", where there's no train/validation comparison for a self-selected
-    cutoff date to leak into). It is NOT the right tool for building a
-    train/validation split — see build_train_validation_matrices for that,
-    and the warning in identify_labeled_events for why.
+    This is the right tool for LIVE SCORING — reference_date is normally "today"
+    (whenever the model is actually being run). There's no train/validation
+    comparison here for a self-selected cutoff date to leak into. It is NOT the
+    right tool for building a train/validation split — see
+    build_train_validation_matrices for that, and the warning in
+    identify_labeled_events for why.
     """
     tx = clean_transactions(tx, members)
     labeled = identify_labeled_events(tx)
-    return build_member_features(tx, labeled, members)
+    return build_member_features(tx, labeled, members, reference_date)
 
 
 def build_train_validation_matrices(
@@ -230,21 +250,43 @@ def build_train_validation_matrices(
     Every member in the train matrix is evaluated as of the SAME external
     train_cutoff date (their most recent eligible transaction at or before it)
     — not their own idiosyncratic last transaction. Validation uses the same
-    approach at validation_cutoff, explicitly excluding any member already used
-    in train. This guarantees disjoint membership by construction and avoids
-    leaking churn status through a self-selected cutoff date (see
-    identify_labeled_events's docstring for the bug this replaced).
+    approach at validation_cutoff. This avoids leaking churn status through a
+    self-selected cutoff date (see identify_labeled_events's docstring for that
+    bug), and disjoint membership is guaranteed by first partitioning MEMBERS
+    into two random pools, then building each split only from its own pool.
+
+    IMPORTANT: an earlier version guaranteed disjointness with exclude_msno
+    (excluding anyone already used in train from validation) instead of a
+    member-pool partition. That looked correct but wasn't: excluding "already
+    used" members means validation can only ever contain members whose FIRST
+    eligible transaction fell after the train cutoff — i.e. structurally only
+    newer/shorter-tenured members, never anyone long-tenured (since anyone
+    long-tenured enough to be eligible by the train cutoff got claimed by
+    train). That's a population-composition split dressed up as a time split.
+    On the real data it broke LightGBM catastrophically (ROC-AUC dropped BELOW
+    0.5 — worse than random) while logistic regression partially masked it
+    through feature scaling. A random member-pool partition keeps both splits'
+    underlying population similar (a mix of old and new members in both), so
+    the only real difference between train and validation is time, which is
+    the whole point of an out-of-time split.
     """
     if pd.Timestamp(train_cutoff) >= pd.Timestamp(validation_cutoff):
         raise ValueError("train_cutoff must be strictly before validation_cutoff")
 
     tx = clean_transactions(tx, members)
 
-    train_labeled = identify_labeled_events(tx, max_transaction_date=train_cutoff)
+    rng = np.random.RandomState(config.RANDOM_SEED)
+    all_msno = tx["msno"].unique()
+    rng.shuffle(all_msno)
+    split_point = int(len(all_msno) * 0.8)
+    train_pool = set(all_msno[:split_point])
+    validation_pool = set(all_msno[split_point:])
+
+    train_labeled = identify_labeled_events(tx[tx["msno"].isin(train_pool)], max_transaction_date=train_cutoff)
     validation_labeled = identify_labeled_events(
-        tx, max_transaction_date=validation_cutoff, exclude_msno=set(train_labeled["msno"])
+        tx[tx["msno"].isin(validation_pool)], max_transaction_date=validation_cutoff
     )
 
-    train_features = build_member_features(tx, train_labeled, members)
-    validation_features = build_member_features(tx, validation_labeled, members)
+    train_features = build_member_features(tx, train_labeled, members, reference_date=train_cutoff)
+    validation_features = build_member_features(tx, validation_labeled, members, reference_date=validation_cutoff)
     return train_features, validation_features

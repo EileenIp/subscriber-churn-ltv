@@ -85,20 +85,87 @@ DATA_MAX_DATE = "2017-02-28"
 #
 # Real Phase 4 run with these cutoffs: TRAIN (every member's state as of
 # TRAIN_CUTOFF_DATE) = 1,125,164 rows, 41.2% churn. VALIDATION (every member's
-# state as of VALIDATION_CUTOFF_DATE, excluding anyone already used in train) =
-# 217,977 rows, 30.6% churn. Zero member overlap. The ~10-point churn-rate gap
-# between splits is normal out-of-time distribution drift, not a leakage signal —
-# nowhere near the earlier 69%/7% artifact.
+# state as of VALIDATION_CUTOFF_DATE) = 268,828 rows, 39.7% churn. Zero member
+# overlap. tenure_days distribution matches closely between splits (train median
+# 893 days, validation median 898) confirming the two populations are genuinely
+# comparable, not systematically different member cohorts.
+#
+# Members are split into disjoint TRAIN/VALIDATION pools BEFORE any time-based
+# eligibility logic runs (see build_train_validation_matrices) — an earlier
+# version guaranteed disjointness by excluding "already used in train" members
+# from validation instead, which silently restricted validation to only
+# newer/shorter-tenured members (anyone long-tenured enough to be eligible by the
+# train cutoff was always claimed by train first). That biased population
+# composition, not genuine time-based drift, and it broke LightGBM badly (ROC-AUC
+# fell BELOW 0.5) while logistic regression partially masked it through feature
+# scaling. Caught via the tenure_days distribution comparison above.
 TRAIN_CUTOFF_DATE = "2016-06-30"
 # The latest date a labeled transaction's expiry can still resolve within the data
 # (DATA_MAX_DATE minus CHURN_WINDOW_DAYS) — maximizes validation recency.
 VALIDATION_CUTOFF_DATE = "2017-01-29"
 
-# --- Phase 4: feature engineering results (2026-09-08) ---
-# Feature matrix (per member, per split): 23 columns, zero nulls in every column.
-# Churn base rates (41.2% train / 30.6% validation) are notably higher than the
+# --- Phase 4: feature engineering results (2026-09-08, corrected 2026-09-09) ---
+# Feature matrix (per member, per split): 24 columns (23 original + days_since_cutoff,
+# added after a Phase 5 bug — see below), zero nulls in every column. Final churn
+# base rates: 41.2% train / 39.7% validation. Both notably higher than the
 # well-known WSDM competition label's 9.0%. Not a bug: that label snapshots
 # currently-active subscribers at one point in time, while ours evaluates every
 # member with enough history as of a reference date — including many who lapsed
 # long before that date and never returned. Document this gap explicitly in the
 # write-up rather than letting it look like an error.
+#
+# days_since_cutoff (reference_date - cutoff_date) was added during Phase 5 after
+# a tuned LightGBM showed near-perfect PR-AUC (~0.97) on a random in-snapshot
+# split but collapsed to 0.54 on real out-of-time validation. Root cause: within
+# any snapshot, how long ago a member's labeled transaction was RELATIVE TO THE
+# SCORING DATE is a near-deterministic churn signal (non-churned members' labeled
+# transaction sits a median 14 days before the reference date; churned members'
+# sits a median 151 days before it) — but that signal wasn't given to the model
+# directly, so it had to reconstruct it indirectly from other features, which
+# memorized the specific snapshot it was tuned on instead of learning something
+# that transfers. Adding it directly (fully known at scoring time, not leaky)
+# fixed this — see src/features.py's build_member_features docstring.
+
+# --- Phase 5: model results (2026-09-09) ---
+# Real validation-set numbers, all three approaches, same split:
+#   Recency rule (days_since_last_transaction)  ROC-AUC=0.567  PR-AUC=0.618
+#   LightGBM (simple, untuned)                  ROC-AUC=0.676  PR-AUC=0.647
+#   Logistic regression                         ROC-AUC=0.936  PR-AUC=0.925
+# LightGBM beats the recency baseline (a real, if modest, win). Logistic
+# regression is the strongest performer of the three — reported honestly rather
+# than downplayed in favour of the "primary" model, consistent with the spec's
+# own baseline-first philosophy. Plausible explanation, not yet independently
+# verified: days_since_cutoff is a dominant, close-to-monotonic predictor, which
+# favours a linear model; LightGBM's tree splits may be less efficient at
+# capturing a single smooth dominant relationship than a scaled linear
+# coefficient is.
+#
+# An explicit hyperparameter tuning attempt (random stratified internal split,
+# early stopping) reached train_eval PR-AUC ~0.986 but did NOT improve real
+# validation performance over the simple untuned model (0.638 vs 0.647) — the
+# simple model was kept. A high in-snapshot PR-AUC is expected here (within any
+# single snapshot, days_since_cutoff separates churned/not-churned almost
+# perfectly by construction) and is not itself a leakage signal anymore now that
+# real out-of-time validation shows a consistent, non-collapsed result.
+
+# Retention-economics assumptions (Checkpoint 5). These are ASSUMED, not observed
+# — the spec requires stating them explicitly rather than hiding a threshold
+# behind an unstated cost model. cost = half of the modal plan price (149,
+# the single most common plan_list_price in the data) as a token retention
+# discount. value = 894, which both approximates 6 months at the modal price
+# (149 x 6 = 894) AND is itself a real observed plan_list_price in the data
+# (likely an actual 6-unit bundle), giving it more grounding than a round guess.
+# success_rate = 30%, a commonly-cited real-world retention-offer effectiveness
+# figure, not derived from this dataset.
+ASSUMED_RETENTION_OFFER_COST = 75
+ASSUMED_RETAINED_SUBSCRIBER_VALUE = 894
+ASSUMED_OFFER_SUCCESS_RATE = 0.30
+
+# Operating threshold: swept 0.05-0.95 on real validation scores, maximizing
+# total expected net benefit under the assumed costs above (see
+# model.select_operating_threshold). At 0.88: precision=0.459, recall=0.842,
+# flags 195,662 of 268,828 validation members (72.8%). The wide net is a direct
+# consequence of the assumed costs (a cheap offer against a high potential
+# payoff justifies flagging broadly) — sensitive to those assumptions, which is
+# exactly why they're stated explicitly rather than buried.
+OPERATING_THRESHOLD = 0.88
