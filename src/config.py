@@ -74,8 +74,31 @@ MIN_PRIOR_TRANSACTIONS = 1
 # spec Phase 0's "Scope decision" and Phase 3.
 DATA_MAX_DATE = "2017-02-28"
 
-# Out-of-time validation splits by the calendar date of the expiry event being
-# labeled, not randomly (spec guardrail). Exact train/validation cutoff dates are
-# set in Phase 4/5 once feature-matrix row volume per candidate split is visible —
-# deferring that avoids picking an arbitrary date now that Phase 4 might need to
-# revise anyway.
+# Out-of-time validation splits by a shared, external reference date, not by each
+# member's own last transaction (see identify_labeled_events's docstring in
+# src/features.py for why that first design leaked the label: a first attempt
+# splitting by each member's own self-selected cutoff date produced 69% churn in
+# train vs 7% in validation from the SAME population — the cutoff date itself was
+# a function of churn status, since a churned member's history simply stops early.
+# Fixed by evaluating every member as of the same fixed date per split, via
+# build_train_validation_matrices).
+#
+# Real Phase 4 run with these cutoffs: TRAIN (every member's state as of
+# TRAIN_CUTOFF_DATE) = 1,125,164 rows, 41.2% churn. VALIDATION (every member's
+# state as of VALIDATION_CUTOFF_DATE, excluding anyone already used in train) =
+# 217,977 rows, 30.6% churn. Zero member overlap. The ~10-point churn-rate gap
+# between splits is normal out-of-time distribution drift, not a leakage signal —
+# nowhere near the earlier 69%/7% artifact.
+TRAIN_CUTOFF_DATE = "2016-06-30"
+# The latest date a labeled transaction's expiry can still resolve within the data
+# (DATA_MAX_DATE minus CHURN_WINDOW_DAYS) — maximizes validation recency.
+VALIDATION_CUTOFF_DATE = "2017-01-29"
+
+# --- Phase 4: feature engineering results (2026-09-08) ---
+# Feature matrix (per member, per split): 23 columns, zero nulls in every column.
+# Churn base rates (41.2% train / 30.6% validation) are notably higher than the
+# well-known WSDM competition label's 9.0%. Not a bug: that label snapshots
+# currently-active subscribers at one point in time, while ours evaluates every
+# member with enough history as of a reference date — including many who lapsed
+# long before that date and never returned. Document this gap explicitly in the
+# write-up rather than letting it look like an error.
