@@ -1,1 +1,1 @@
-"""Streamlit dashboard — risk-vs-value quadrant, segment cards, player lookup. Built in Phase 7."""
+"""Streamlit dashboard — risk-vs-value quadrant, segment cards, subscriber lookup. Built in Phase 7."""

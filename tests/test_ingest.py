@@ -1,18 +1,19 @@
 from src import config, ingest
 
 
-def test_load_reg_data_schema():
-    df = ingest.load_reg_data()
-    assert list(df.columns) == config.REG_DATA_COLUMNS
-    assert df["uid"].is_unique
+def test_load_members_schema():
+    df = ingest.load_members()
+    assert list(df.columns) == config.MEMBERS_COLUMNS
+    assert df["msno"].is_unique
 
 
-def test_load_ab_test_data_schema():
-    df = ingest.load_ab_test_data()
-    assert list(df.columns) == config.AB_TEST_COLUMNS
-    assert df["user_id"].is_unique
+def test_load_train_labels_schema():
+    df = ingest.load_train_labels()
+    assert list(df.columns) == config.TRAIN_LABELS_COLUMNS
+    assert df["msno"].is_unique
+    assert set(df["is_churn"].unique()) <= {0, 1}
 
 
-def test_reg_data_no_nulls():
-    df = ingest.load_reg_data()
-    assert df.isnull().sum().sum() == 0
+def test_members_no_nulls_in_id():
+    df = ingest.load_members()
+    assert df["msno"].isnull().sum() == 0
