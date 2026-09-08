@@ -483,3 +483,9 @@ Say each answer out loud before the case study goes live. Written fluency is not
 One sentence, ready to deliver: *"I built a churn early-warning model for free-to-play players and crossed the risk score against player value, so a studio can spend retention budget on the players actually worth keeping — the model flags [X]% of lapsing players [N] days early."*
 
 ☐ Fill the bracketed numbers from the real results. Never a placeholder.
+
+---
+
+## Session log
+
+- 2026-09-08 — Checkpoint −1 passed (go). Checkpoint 0 passed: dataset locked to `debs2x/gamelytics-mobile-analytics-challenge` (Kaggle) — real per-player revenue, 1M registered players, 9.6M login events. Phase 1 complete: repo scaffold created, `src/ingest.py` validates schema and prints a data quality summary (chunked for the 9.6M-row auth log), 3 tests passing, committed (`ff64558`). Next: Phase 2 (data quality investigation).
